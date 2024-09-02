@@ -29,6 +29,5 @@
 #include <stdint.h>
 
 void telemetry(void);
-void telemetry_fast(void);
 
 #endif

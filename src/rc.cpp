@@ -28,231 +28,186 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include "flight_control.hpp"
+#include <zenoh-pico.h>
+#include <ArduinoJson.h>
+
+// WiFi-specific parameters
+#define SSID "Buffalo-2G-EF00"
+#define PASS "brnk34t5u75aa"
+
+#define CLIENT_OR_PEER 1  // 0: Client mode; 1: Peer mode
+#if CLIENT_OR_PEER == 0
+#define MODE "client"
+#define CONNECT ""  // If empty, it will scout
+#elif CLIENT_OR_PEER == 1
+#define MODE "peer"
+#define CONNECT "udp/224.0.0.225:7447#iface=en0"
+#else
+#error "Unknown Zenoh operation mode. Check CLIENT_OR_PEER value."
+#endif
+
+#define SUB_PREFIX "control"
+#define PUB_PREFIX "drone"
+
+z_owned_session_t zenoh_session;
+z_owned_publisher_t zenoh_pub;
 
 // esp_now_peer_info_t slave;
 
 volatile uint16_t Connect_flag = 0;
 
-// Telemetry相手のMAC ADDRESS 4C:75:25:AD:B6:6C
-// ATOM Lite (C): 4C:75:25:AE:27:FC
-// 4C:75:25:AD:8B:20
-// 4C:75:25:AF:4E:84
-// 4C:75:25:AD:8B:20
-// 4C:75:25:AD:8B:20 赤水玉テープ　ATOM lite
-uint8_t TelemAddr[6] = {0};
-// uint8_t TelemAddr[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-volatile uint8_t MyMacAddr[6];
-volatile uint8_t peer_command[4] = {0xaa, 0x55, 0x16, 0x88};
-volatile uint8_t Rc_err_flag     = 0;
-esp_now_peer_info_t peerInfo;
-
 // RC
 volatile float Stick[16];
 volatile uint8_t Recv_MAC[3];
 
-void on_esp_now_sent(const uint8_t *mac_addr, esp_now_send_status_t status);
+volatile uint8_t Rc_err_flag = 0;
 
 // 受信コールバック
-void OnDataRecv(const uint8_t *mac_addr, const uint8_t *recv_data, int data_len) {
+void zenoh_data_handler(const z_sample_t *sample, void *arg) {
     Connect_flag = 0;
 
-    uint8_t *d_int;
-    // int16_t d_short;
-    float d_float;
+    // 受信したペイロードを文字列として取得
+    std::string payload((const char *)sample->payload.start, sample->payload.len);
+    //USBSerial.println(payload.c_str());
 
-    if (!TelemAddr[0] && !TelemAddr[1] && !TelemAddr[2] && !TelemAddr[3] && !TelemAddr[4] && !TelemAddr[5]) {
-        memcpy(TelemAddr, mac_addr, 6);
-        memcpy(peerInfo.peer_addr, TelemAddr, 6);
-        peerInfo.channel = CHANNEL;
-        peerInfo.encrypt = false;
-        if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-            USBSerial.println("Failed to add peer2");
-            memset(TelemAddr, 0, 6);
-        } else {
-            esp_now_register_send_cb(on_esp_now_sent);
-        }
-    }
+    // JSONオブジェクトとしてパース
+    JsonDocument doc;  // 256バイトのバッファを使用
+    DeserializationError error = deserializeJson(doc, payload);
 
-    Recv_MAC[0] = recv_data[0];
-    Recv_MAC[1] = recv_data[1];
-    Recv_MAC[2] = recv_data[2];
-
-    if ((recv_data[0] == MyMacAddr[3]) && (recv_data[1] == MyMacAddr[4]) && (recv_data[2] == MyMacAddr[5])) {
-        Rc_err_flag = 0;
-    } else {
-        Rc_err_flag = 1;
+    if (error) {
+        USBSerial.print("Failed to parse JSON: ");
+        USBSerial.println(error.c_str());
         return;
     }
 
-    // checksum
-    uint8_t check_sum = 0;
-    for (uint8_t i = 0; i < 24; i++) check_sum = check_sum + recv_data[i];
-    // if (check_sum!=recv_data[23])USBSerial.printf("checksum=%03d recv_sum=%03d\n\r", check_sum, recv_data[23]);
-    if (check_sum != recv_data[24]) {
-        Rc_err_flag = 1;
-        return;
+    // JSONオブジェクトから各値を取得
+    if (doc.containsKey("rudder")) {
+        Stick[RUDDER] = doc["rudder"].as<float>();
     }
-
-    d_int         = (uint8_t *)&d_float;
-    d_int[0]      = recv_data[3];
-    d_int[1]      = recv_data[4];
-    d_int[2]      = recv_data[5];
-    d_int[3]      = recv_data[6];
-    Stick[RUDDER] = d_float;
-
-    d_int[0]        = recv_data[7];
-    d_int[1]        = recv_data[8];
-    d_int[2]        = recv_data[9];
-    d_int[3]        = recv_data[10];
-    Stick[THROTTLE] = d_float;
-
-    d_int[0]       = recv_data[11];
-    d_int[1]       = recv_data[12];
-    d_int[2]       = recv_data[13];
-    d_int[3]       = recv_data[14];
-    Stick[AILERON] = d_float;
-
-    d_int[0]        = recv_data[15];
-    d_int[1]        = recv_data[16];
-    d_int[2]        = recv_data[17];
-    d_int[3]        = recv_data[18];
-    Stick[ELEVATOR] = d_float;
-
-    Stick[BUTTON_ARM]     = recv_data[19];  // auto_up_down_status
-    Stick[BUTTON_FLIP]    = recv_data[20];
-    Stick[CONTROLMODE]    = recv_data[21];  // Mode:rate or angle control
-    Stick[ALTCONTROLMODE] = recv_data[22];  // 高度制御
-
-    ahrs_reset_flag = recv_data[23];
+    if (doc.containsKey("throttle")) {
+        Stick[THROTTLE] = doc["throttle"].as<float>();
+    }
+    if (doc.containsKey("aileron")) {
+        Stick[AILERON] = doc["aileron"].as<float>();
+    }
+    if (doc.containsKey("elevator")) {
+        Stick[ELEVATOR] = doc["elevator"].as<float>();
+    }
+    if (doc.containsKey("button_arm")) {
+        Stick[BUTTON_ARM] = doc["button_arm"].as<float>();
+    }
+    if (doc.containsKey("button_flip")) {
+        Stick[BUTTON_FLIP] = doc["button_flip"].as<float>();
+    }
+    if (doc.containsKey("controlmode")) {
+        Stick[CONTROLMODE] = doc["controlmode"].as<float>();
+    }
+    if (doc.containsKey("altcontrolmode")) {
+        Stick[ALTCONTROLMODE] = doc["altcontrolmode"].as<float>();
+    }
 
     Stick[LOG] = 0.0;
-    // if (check_sum!=recv_data[23])USBSerial.printf("checksum=%03d recv_sum=%03d\n\r", check_sum, recv_data[23]);
 
 #if 0
-  USBSerial.printf("%6.3f %6.3f %6.3f %6.3f %6.3f %6.3f %6.3f %6.3f  %6.3f\n\r", 
-                                            Stick[THROTTLE],
-                                            Stick[AILERON],
-                                            Stick[ELEVATOR],
-                                            Stick[RUDDER],
-                                            Stick[BUTTON_ARM],
-                                            Stick[BUTTON_FLIP],
-                                            Stick[CONTROLMODE],
-                                            Stick[ALTCONTROLMODE],
-                                            Stick[LOG]);
+    // デバッグ用に受信したJSONデータを出力
+    USBSerial.println("Received JSON Data:");
+    serializeJsonPretty(doc, USBSerial);
 #endif
-}
-
-// 送信コールバック
-uint8_t esp_now_send_status;
-void on_esp_now_sent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    esp_now_send_status = status;
 }
 
 void rc_init(void) {
     // Initialize Stick list
     for (uint8_t i = 0; i < 16; i++) Stick[i] = 0.0;
 
-    // ESP-NOW初期化
+    // WiFiの設定
+    // wifi接続カウント
+    uint8_t Cnt = 0;
+    USBSerial.print("Connecting to WiFi...");
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
+    WiFi.begin(SSID, PASS);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(1000);
+        // 一定時間経過後に再起動
+        if (Cnt++ > 10) {
+            USBSerial.println("Unable to connect to WiFi!");
+            ESP.restart();
+        }
+    }
+    USBSerial.println("OK");
 
-    WiFi.macAddress((uint8_t *)MyMacAddr);
-    USBSerial.printf("MAC ADDRESS: %02X:%02X:%02X:%02X:%02X:%02X\r\n", MyMacAddr[0], MyMacAddr[1], MyMacAddr[2],
-                     MyMacAddr[3], MyMacAddr[4], MyMacAddr[5]);
+    // Zenohセッションの初期化
+    z_owned_config_t config = z_config_default();
+    zp_config_insert(z_config_loan(&config), Z_CONFIG_MODE_KEY, z_string_make(MODE));
+    if (strcmp(CONNECT, "") != 0) {
+        zp_config_insert(z_config_loan(&config), Z_CONFIG_CONNECT_KEY, z_string_make(CONNECT));
+    }
 
-    if (esp_now_init() == ESP_OK) {
-        USBSerial.println("ESPNow Init Success");
-    } else {
-        USBSerial.println("ESPNow Init Failed");
+    // Zenohセッションのオープン
+    Serial.print("Opening Zenoh Session...");
+    zenoh_session = z_open(z_config_move(&config));
+    if (!z_session_check(&zenoh_session)) {
+        USBSerial.println("Unable to open Zenoh session!");
         ESP.restart();
     }
+    USBSerial.println("OK");
 
-    // MACアドレスブロードキャスト
-    uint8_t addr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-    memcpy(peerInfo.peer_addr, addr, 6);
-    peerInfo.channel = CHANNEL;
-    peerInfo.encrypt = false;
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        USBSerial.println("Failed to add peer");
-        return;
-    }
-    esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+    // // パブリッシャーの宣言
+    // zenoh_pub = z_declare_publisher(z_session_loan(&zenoh_session), z_keyexpr(PUB_PREFIX), NULL);
+    // if (!z_publisher_check(&zenoh_pub)) {
+    //     USBSerial.println("Unable to declare Zenoh publisher!");
+    //     ESP.restart();
+    // }
 
-    // Send my MAC address
-    for (uint16_t i = 0; i < 50; i++) {
-        send_peer_info();
-        delay(50);
-        USBSerial.printf("%d\n", i);
-    }
+    // Start the receive and the session lease loop for zenoh-pico
+    zp_start_read_task(z_session_loan(&zenoh_session), NULL);
+    zp_start_lease_task(z_session_loan(&zenoh_session), NULL);
 
-    // ESP-NOW再初期化
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    if (esp_now_init() == ESP_OK) {
-        USBSerial.println("ESPNow Init Success2");
-    } else {
-        USBSerial.println("ESPNow Init Failed2");
+    // サブスクライバーの宣言
+    USBSerial.print("Declaring Subscriber on ");
+    USBSerial.print(SUB_PREFIX);
+    USBSerial.println(" ...");
+    z_owned_closure_sample_t callback = z_closure_sample(zenoh_data_handler, NULL, NULL);
+    z_owned_subscriber_t sub = z_declare_subscriber(z_session_loan(&zenoh_session), z_keyexpr(SUB_PREFIX), z_closure_sample_move(&callback), NULL);
+    if (!z_subscriber_check(&sub)) {
+        USBSerial.println("Unable to declare Zenoh subscriber.");
         ESP.restart();
     }
+    USBSerial.println("OK");
+    USBSerial.println("Zenoh-Pico Ready.");
 
-    // ESP-NOWコールバック登録
-    esp_now_register_recv_cb(OnDataRecv);
-    USBSerial.println("ESP-NOW Ready.");
+    delay(300);
 }
 
-void send_peer_info(void) {
-    uint8_t data[11];
-    data[0] = CHANNEL;
-    memcpy(&data[1], (uint8_t *)MyMacAddr, 6);
-    memcpy(&data[1 + 6], (uint8_t *)peer_command, 4);
-    esp_now_send(peerInfo.peer_addr, data, 11);
-}
+void telemetry_send(JsonDocument& doc) {
+    // JSONオブジェクトをシリアル化して文字列に変換
+    char payload[1024];
+    size_t len = serializeJson(doc, payload, sizeof(payload));
 
-uint8_t telemetry_send(uint8_t *data, uint16_t datalen) {
-    static uint32_t cnt       = 0;
-    static uint8_t error_flag = 0;
-    static uint8_t state      = 0;
+#if 1
+    // デバッグ用にシリアル出力
+    Serial.println("Sending JSON Data:");
+    Serial.println(payload);
+#endif
 
-    esp_err_t result;
-
-    if ((error_flag == 0) && (state == 0)) {
-        result = esp_now_send(peerInfo.peer_addr, data, datalen);
-        cnt    = 0;
-    } else
-        cnt++;
-
-    if (esp_now_send_status == 0) {
-        error_flag = 0;
-        // state = 0;
+    // Zenohにデータを送信
+    if (z_publisher_put(z_publisher_loan(&zenoh_pub), (const uint8_t *)payload, len, NULL) < 0) {
+        Serial.println("Error while publishing JSON data");
     } else {
-        error_flag = 1;
-        // state = 1;
+        Serial.println("Successfully published JSON data");
     }
-    // 一度送信エラーを検知してもしばらくしたら復帰する
-    if (cnt > 500) {
-        error_flag = 0;
-        cnt        = 0;
-    }
-    cnt++;
-    // USBSerial.printf("%6d %d %d\r\n", cnt, error_flag, esp_now_send_status);
-
-    return error_flag;
 }
 
 void rc_end(void) {
-    // Ps3.end();
+    // Zenohセッションのクローズ処理などを行います
+    z_close(z_session_move(&zenoh_session));
 }
 
 uint8_t rc_isconnected(void) {
-    bool status;
     Connect_flag++;
-    if (Connect_flag < 40)
-        status = 1;
-    else
-        status = 0;
-    // USBSerial.printf("%d \n\r", Connect_flag);
-    return status;
+    return (Connect_flag < 40) ? 1 : 0;
 }
 
 void rc_demo() {
+    // デモ用の処理を追加できます
 }
